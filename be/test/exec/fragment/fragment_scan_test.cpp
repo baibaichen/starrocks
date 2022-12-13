@@ -20,7 +20,8 @@
 #include "exec/pipeline/pipeline_driver_executor.h"
 #include "exec/pipeline/scan/connector_scan_operator.h"
 #include "exec/connector_scan_node.h"
-#include "gen_cpp/InternalService_types.h"
+#include "service/brpc.h"
+#include "gen_cpp/doris_internal_service.pb.h"
 #include "gtest/gtest.h"
 #include "gutil/map_util.h"
 #include "runtime/descriptor_helper.h"
@@ -34,9 +35,30 @@
 #include "util/disk_info.h"
 #include "util/mem_info.h"
 #include "util/thrift_util.h"
+#include "testutil/assert.h"
+
+namespace brpc {
+
+    DECLARE_uint64(max_body_size);
+    DECLARE_int64(socket_max_unwritten_bytes);
+
+} // namespace brpc
 
 namespace starrocks{
 
+    class mock_internal: public doris::PBackendService {
+        void transmit_chunk(google::protobuf::RpcController* cntl_base,
+                            const PTransmitChunkParams* request, PTransmitChunkResult* response,
+                            google::protobuf::Closure* done) override;
+    };
+
+    void mock_internal::transmit_chunk(google::protobuf::RpcController *cntl_base, const PTransmitChunkParams *request,
+                                       PTransmitChunkResult *response, google::protobuf::Closure *done) {
+        // PBackendService::transmit_chunk(cntl_base, request, response, done);
+        Status st;
+        st.to_protobuf(response->mutable_status());
+        done->Run();
+    }
 
     class FragmentScanTest : public ::testing::Test {
         void SetUp() override {
@@ -49,6 +71,8 @@ namespace starrocks{
         void init_desc_tbl(const std::vector<TypeDescriptor>& types);
         void init_plan_exec_params(const std::vector<TypeDescriptor>& types);
         void init_plan_fragment();
+        void start_be();
+        void be();
         void onFinish(PlanFragmentExecutor* exec);
         static void _configPlanNode(TPlanNode& planNode);
         static std::vector<TScanRangeParams> _createCSVScanRanges(const std::vector<TypeDescriptor>& types,
@@ -57,12 +81,18 @@ namespace starrocks{
 
         static const TTupleId tupleId = 0;
         static const TPlanNodeId scanNodeId = 1;
+        static std::atomic<bool> k_exit;
+        static std::atomic<bool> k_be_started;
     private:
         ExecEnv* _exec_env = nullptr;
         TExecPlanFragmentParams _request;
         std::future<void> _finish_future;
         std::promise<void> _finish_promise;
+        std::unique_ptr<std::thread> _mock_backend_thread;
     };
+
+    std::atomic<bool> FragmentScanTest::k_exit = false;
+    std::atomic<bool> FragmentScanTest::k_be_started = false;
 
     void FragmentScanTest::init_desc_tbl(const std::vector<TypeDescriptor>& types) {
         /// Init DescriptorTable
@@ -123,6 +153,8 @@ namespace starrocks{
     }
 
     void FragmentScanTest::onFinish(PlanFragmentExecutor *exec) {
+        k_exit.store(true);
+
         _finish_promise.set_value();
         ASSERT_TRUE(exec->is_done());
         ASSERT_TRUE(exec->status().ok());
@@ -180,6 +212,40 @@ namespace starrocks{
         _request.__set_params(params);
     }
 
+    void FragmentScanTest::start_be() {
+        _mock_backend_thread = std::make_unique<std::thread>(&FragmentScanTest::be, this);
+        while (!FragmentScanTest::k_be_started.load()) {
+            sleep(1);
+        }
+    }
+
+    void FragmentScanTest::be() {
+        // 2. Start brpc services.
+        brpc::FLAGS_max_body_size = starrocks::config::brpc_max_body_size;
+        brpc::FLAGS_socket_max_unwritten_bytes = starrocks::config::brpc_socket_max_unwritten_bytes;
+
+        brpc::Server brpc_server;
+
+        mock_internal mock;
+        brpc_server.AddService(&mock, brpc::SERVER_DOESNT_OWN_SERVICE);
+        brpc::ServerOptions options;
+
+        if (brpc_server.Start(starrocks::config::brpc_port, &options) != 0) {
+            LOG(ERROR) << "BRPC service did not start correctly, exiting";
+            starrocks::shutdown_logging();
+            exit(1);
+        }
+
+        k_be_started.store(true);
+
+        while (!FragmentScanTest::k_exit.load()) {
+            sleep(10);
+        }
+
+        brpc_server.Stop(0);
+        brpc_server.Join();
+    }
+
 
     TEST_F(FragmentScanTest, CSVBasic) {
         init();
@@ -187,5 +253,33 @@ namespace starrocks{
         Status status = _exec_env->fragment_mgr()->exec_plan_fragment(_request, cb);
         ASSERT_EQ(std::future_status::ready, _finish_future.wait_for(std::chrono::seconds(15)));
         ASSERT_TRUE(status.ok());
+    }
+
+    TEST_F(FragmentScanTest, ReadJson) {
+
+        start_be();
+
+        auto fs = FileSystem::Default();
+        std::string fname = "/home/chang/test/20221208223008.053.json";
+        auto rfile = *fs->new_random_access_file(fname);
+        ASSIGN_OR_ABORT(auto file_size, rfile->get_size())
+
+        raw::RawVector<uint8_t> buff;
+        buff.resize(file_size);
+        ASSERT_OK(rfile->read_fully(buff.data(), file_size));
+        ASSERT_EQ(buff.size(), file_size);
+        TExecPlanFragmentParams fromJson;
+        uint32_t len = buff.size();
+        ASSERT_OK(deserialize_thrift_msg(buff.data(), &len, TProtocolType::JSON, &fromJson));
+        ASSERT_TRUE(fromJson.__isset.desc_tbl);
+
+        _finish_future = _finish_promise.get_future();
+        FragmentMgr::FinishCallback cb = [this](auto && PH1) { onFinish(std::forward<decltype(PH1)>(PH1)); };
+        Status status = _exec_env->fragment_mgr()->exec_plan_fragment(fromJson, cb);
+        ASSERT_TRUE(status.ok());
+        ASSERT_EQ(std::future_status::ready, _finish_future.wait_for(std::chrono::seconds(1000)));
+
+
+        _mock_backend_thread->join();
     }
 }

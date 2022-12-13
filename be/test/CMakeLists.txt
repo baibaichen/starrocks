@@ -354,6 +354,10 @@ add_executable(starrocks_test ${EXEC_FILES})
 TARGET_LINK_LIBRARIES(starrocks_test ${TEST_LINK_LIBS})
 SET_TARGET_PROPERTIES(starrocks_test PROPERTIES COMPILE_FLAGS "-fno-access-control")
 
+add_executable(run_segment run_segment.cpp)
+TARGET_LINK_LIBRARIES(run_segment ${STARROCKS_LINK_LIBS})
+SET_TARGET_PROPERTIES(run_segment PROPERTIES COMPILE_FLAGS "-fno-access-control")
+
 # =================================================
 # bytes_test requires tcmalloc which conflicts with sanitizer.
 # Thus we need a standalone binary without sanitizer to test it.

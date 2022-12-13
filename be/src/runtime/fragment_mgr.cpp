@@ -229,6 +229,7 @@ std::string FragmentExecState::to_http_path(const std::string& file_name) {
 // Also, the reported status will always reflect the most recent execution status,
 // including the final status when execution finishes.
 void FragmentExecState::coordinator_callback(const Status& status, RuntimeProfile* profile, bool done) {
+#ifndef BE_TEST
     DCHECK(status.ok() || done); // if !status.ok() => done
     Status exec_status = update_status(status);
 
@@ -343,6 +344,7 @@ void FragmentExecState::coordinator_callback(const Status& status, RuntimeProfil
         update_status(rpc_status);
         _executor.cancel();
     }
+#endif
 }
 
 FragmentMgr::FragmentMgr(ExecEnv* exec_env)
